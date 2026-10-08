@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nonpdf"
+version = "0.1.0-beta"
+description = "PDF pentesting framework — callback-driven payload generator and listener cockpit."
+authors = [{name = "Anonymous-beta"}]
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "textual>=0.80",
+    "rich>=13.7",
+    "validators>=0.22",
+    "aiohttp>=3.9",
+    "click>=8.1",
+]
+
+[project.scripts]
+nonpdf = "nonpdf.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["nonpdf"]
