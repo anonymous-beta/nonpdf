@@ -2,9 +2,9 @@
 
 Screens:
   DashboardScreen  — banner + quick stats + nav
-  GenerateScreen   — callback, profile, obfuscation, run, live log
+  GenerateScreen   — callback, profile, obfuscation, run, live log, correlator
   PayloadsScreen   — full registry browser with filters
-  ListenerScreen   — start/stop HTTP callback server + live hit feed
+  ListenerScreen   — HTTP + DNS listeners, live hit feed, click-through
   AboutScreen      — Anonymous-beta (chinedu) branding
 """
 from __future__ import annotations
@@ -21,10 +21,10 @@ from textual.widgets import (
 )
 
 from nonpdf import __brand__, __creator__, __version__
-from nonpdf.core.generator import PROFILES, Generator
+from nonpdf.core.generator import PROFILES
 from nonpdf.core.registry import registry
-from nonpdf.net.callback import CallbackServer, Hit
-from nonpdf.tui.widgets import Banner, StatusBar, build_payload_table
+from nonpdf.net.session import Session, SessionHit
+from nonpdf.tui.widgets import Banner, StatusBar
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -99,13 +99,14 @@ class DashboardScreen(Screen):
         lines = ["[b cyan]Recent activity[/]"]
         if s.recent_builds:
             lines.append("[b]last builds[/]")
-            for path, desc in s.recent_builds[:6]:
-                lines.append(f"  [green]·[/] {Path(path).name}  [dim]{desc}[/]")
+            for path, desc, pid, _cid in s.recent_builds[:6]:
+                lines.append(f"  [green]·[/] [b]{pid}[/] {Path(path).name}  [dim]{desc}[/]")
         if s.hits:
             lines.append("")
             lines.append("[b]last callbacks[/]")
-            for ts, method, ip, path in s.hits[:6]:
-                lines.append(f"  [magenta]·[/] {ts}  {method:<4}  {ip:<15}  {path}")
+            for ts, source, method, ip, path, _cid in s.hits[:6]:
+                tag = "[magenta]dns [/]" if source == "dns" else "[cyan]http[/]"
+                lines.append(f"  {tag}  {ts}  {method:<4}  {ip:<15}  {path}")
         if len(lines) == 1:
             lines.append("[dim]no activity yet — run a generation or start the listener[/]")
         return "\n".join(lines)
@@ -142,10 +143,10 @@ class GenerateScreen(Screen):
             yield Label("[b cyan]GENERATE PAYLOADS[/]", classes="section-title")
             with Horizontal(id="gen-form"):
                 with Vertical(classes="form-col"):
-                    yield Label("Callback URL / IP", classes="field-label")
+                    yield Label("Callback URL / domain", classes="field-label")
                     yield Input(
                         value=s.callback,
-                        placeholder="https://collab.example.com  or  10.0.0.5",
+                        placeholder="collab.example.com  or  https://collab.example.com",
                         id="inp-callback",
                     )
                     yield Label("Output directory", classes="field-label")
@@ -174,19 +175,21 @@ class GenerateScreen(Screen):
 
     def on_mount(self) -> None:
         self._sync_label()
-        self._status().update_status(
-            callback=self.app.state.callback,
-            profile=self.app.state.profile,
-            obfuscate=self.app.state.obfuscate,
-            hits=len(self.app.state.hits),
-            builds=len(self.app.state.recent_builds),
-        )
+        self._refresh_status()
         self.query_one("#gen-log", RichLog).write(
             "[dim]ready. set a callback and hit Run (or Ctrl+R).[/]"
         )
 
     def _status(self) -> StatusBar:
         return self.query_one("#status", StatusBar)
+
+    def _refresh_status(self) -> None:
+        s = self.app.state
+        self._status().update_status(
+            callback=s.callback, profile=s.profile,
+            obfuscate=s.obfuscate, hits=len(s.hits),
+            builds=len(s.recent_builds),
+        )
 
     def _sync_label(self) -> None:
         v = int(self.query_one("#sld-obf", Slider).value)
@@ -204,12 +207,7 @@ class GenerateScreen(Screen):
     def on_slider_changed(self, event: Slider.Changed) -> None:
         self.app.state.obfuscate = int(event.value)
         self._sync_label()
-        s = self.app.state
-        self._status().update_status(
-            callback=s.callback, profile=s.profile,
-            obfuscate=s.obfuscate, hits=len(s.hits),
-            builds=len(s.recent_builds),
-        )
+        self._refresh_status()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "sel-profile":
@@ -221,11 +219,7 @@ class GenerateScreen(Screen):
             s.callback = event.value
         elif event.input.id == "inp-output":
             s.output_dir = event.value or "output"
-        self._status().update_status(
-            callback=s.callback, profile=s.profile,
-            obfuscate=s.obfuscate, hits=len(s.hits),
-            builds=len(s.recent_builds),
-        )
+        self._refresh_status()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn-run":
@@ -246,10 +240,9 @@ class GenerateScreen(Screen):
 
         log = self.query_one("#gen-log", RichLog)
         if not callback:
-            log.write("[bold red]error:[/] callback URL is required.")
+            log.write("[bold red]error:[/] callback URL/domain is required.")
             return
 
-        # persist to state
         s = self.app.state
         s.callback = callback
         s.output_dir = output
@@ -266,48 +259,84 @@ class GenerateScreen(Screen):
 
     def _do_generation(self, callback: str, output: str,
                        profile: str, obf: int, only: list[str] | None):
-        def emit(msg: str) -> None:
-            self.app.call_from_thread(self.query_one("#gen-log", RichLog).write, msg)
+        app = self.app
 
-        def finish(results) -> None:
-            self._refresh_status_only()
+        def emit(msg: str) -> None:
+            app.call_from_thread(self.query_one("#gen-log", RichLog).write, msg)
+
+        def refresh() -> None:
+            app.call_from_thread(self._refresh_status)
 
         try:
-            gen = Generator(
-                callback=callback, output_dir=output,
-                profile=profile, obfuscate=obf,
+            session = app.session
+            entries = (
+                registry.filter(ids=only) if only
+                else _select_for_profile(profile)
             )
-            entries = gen._select(only)
             emit(f"[dim]selected {len(entries)} payloads[/]")
-            results = []
+            built = 0
             for entry in entries:
                 try:
-                    data = entry.builder(host=callback)
-                    data = gen._brand(data)
-                    path = Path(output) / f"{entry.id}_{entry.name}.pdf"
+                    corr = session.mint_for(entry.id, entry.name)
+                    data = entry.builder(host=corr.callback_url)
+                    data = _brand_artifact(data)
+                    path = Path(output) / f"{entry.id}_{entry.name}_{corr.corr_id}.pdf"
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(data)
                     if obf:
                         from nonpdf.core.obfuscator import obfuscate_pdf
                         obfuscate_pdf(path, obf)
-                    self.app.state.add_build(str(path), entry.description)
-                    emit(f"[green]✔[/] {path.name}  [dim]{entry.description}[/]")
-                    results.append(path)
+
+                    session.record_build(
+                        payload_id=entry.id, payload_name=entry.name,
+                        corr_id=corr.corr_id, callback_url=corr.callback_url,
+                        domain=corr.domain, path=str(path),
+                        description=entry.description, obfuscate=obf,
+                    )
+                    app.state.add_build(str(path), entry.description,
+                                        entry.id, corr.corr_id)
+                    emit(
+                        f"[green]✔[/] {path.name}\n"
+                        f"    [dim]corr[/] {corr.corr_id}  "
+                        f"[dim]url[/] {corr.callback_url}"
+                    )
+                    built += 1
                 except Exception as exc:  # noqa: BLE001
                     emit(f"[red]✘[/] {entry.id} {entry.name}: {exc}")
-            emit(f"[bold green]done.[/] {len(results)} file(s) → {output}/")
+            emit(f"[bold green]done.[/] {built} file(s) → {output}/")
         except Exception as exc:  # noqa: BLE001
             emit(f"[bold red]generation failed:[/] {exc}")
         finally:
-            self.app.call_from_thread(self._refresh_status_only)
+            refresh()
 
-    def _refresh_status_only(self) -> None:
-        s = self.app.state
-        self._status().update_status(
-            callback=s.callback, profile=s.profile,
-            obfuscate=s.obfuscate, hits=len(s.hits),
-            builds=len(s.recent_builds),
-        )
+
+def _select_for_profile(profile: str):
+    from nonpdf.core.generator import PROFILES as P
+    spec = P.get(profile, P["full"])
+    if spec.get("ids") == ["*"]:
+        return registry.all()
+    return registry.filter(
+        platform=spec.get("platform"),
+        tags=spec.get("tags"),
+    )
+
+
+def _brand_artifact(data: bytes) -> bytes:
+    """Apply Anonymous-beta (chinedu) metadata signature."""
+    from nonpdf.core.branding import INFO_DICT, PDF_HEADER_COMMENT
+    from nonpdf.core.generator import Generator
+    nl = data.find(b'\n')
+    if nl != -1 and data.startswith(b'%PDF'):
+        data = data[:nl + 1] + PDF_HEADER_COMMENT + data[nl + 1:]
+    tidx = data.rfind(b'trailer')
+    if tidx != -1:
+        section = data[tidx:]
+        if b'/Info' not in section:
+            last = section.rfind(b'>>')
+            if last != -1:
+                pos = tidx + last
+                data = data[:pos] + INFO_DICT + b'\n' + data[pos:]
+    return Generator._append_footer(data)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -361,15 +390,15 @@ class PayloadsScreen(Screen):
         tbl = self.query_one("#payload-table", DataTable)
         tbl.clear(columns=True)
         tbl.add_columns("ID", "Name", "Platform", "CVE", "Tags", "Description")
-        for entry in registry.filter(platform=plat, tags={tag} if tag else None):
+        entries = registry.filter(platform=plat, tags={tag} if tag else None)
+        for entry in entries:
             tbl.add_row(
                 entry.id, entry.name, entry.platform,
                 entry.cve or "—", ",".join(entry.tags) or "—",
                 entry.description, key=entry.id,
             )
         self.query_one("#pay-detail", Static).update(
-            f"[dim]{len(registry.filter(platform=plat, tags={tag} if tag else None))}"
-            f" payload(s) shown[/]"
+            f"[dim]{len(entries)} payload(s) shown[/]"
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -406,105 +435,177 @@ class PayloadsScreen(Screen):
 class ListenerScreen(Screen):
     BINDINGS = [
         Binding("escape", "goto('dashboard')", "Back"),
-        Binding("ctrl+s", "toggle_listener", "Start/Stop"),
-        Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("ctrl+s", "toggle_http", "HTTP start/stop"),
+        Binding("ctrl+d", "toggle_dns", "DNS start/stop"),
+        Binding("ctrl+l", "clear_log", "Clear log"),
+        Binding("ctrl+e", "export", "Export"),
     ]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Container(id="lis-wrap"):
-            yield Label("[b cyan]CALLBACK LISTENER[/]", classes="section-title")
+            yield Label("[b cyan]CALLBACK LISTENERS[/]", classes="section-title")
             with Horizontal(id="lis-form"):
-                yield Label("Bind port:", classes="filter-label")
-                yield Input(value="8080", id="inp-port")
-                yield Button("Start", id="btn-listen-start", variant="success")
-                yield Button("Stop", id="btn-listen-stop", variant="error")
-                yield Static("[dim]idle[/]", id="lis-status")
+                yield Label("HTTP:", classes="filter-label")
+                yield Input(value="8080", id="inp-http-port")
+                yield Button("HTTP ▶", id="btn-http-start", variant="success")
+                yield Button("HTTP ■", id="btn-http-stop", variant="error")
+                yield Label("DNS:", classes="filter-label")
+                yield Input(value="53", id="inp-dns-port")
+                yield Input(value="127.0.0.1", id="inp-dns-answer")
+                yield Button("DNS ▶", id="btn-dns-start", variant="success")
+                yield Button("DNS ■", id="btn-dns-stop", variant="error")
+            with Horizontal(id="lis-status-row"):
+                yield Static("[dim]HTTP idle[/]", id="lis-http-status")
+                yield Static("[dim]DNS idle[/]", id="lis-dns-status")
+                yield Static("[dim]engagement: —[/]", id="lis-eng-status")
+                yield Button("Export bundle", id="btn-export", variant="primary")
             yield RichLog(id="lis-log", highlight=True, markup=True)
+            yield Static(id="lis-hit-detail", classes="panel")
         yield StatusBar(id="status")
         yield Footer()
 
     def on_mount(self) -> None:
-        self._log_line("[dim]listener idle. press Start (Ctrl+S) to bind.[/]")
-        s = self.app.state
-        self._status().update_status(
-            callback=s.callback, profile=s.profile,
-            obfuscate=s.obfuscate, hits=len(s.hits),
-            builds=len(s.recent_builds),
-        )
+        self._log_line("[dim]listeners idle. Ctrl+S → HTTP, Ctrl+D → DNS.[/]")
+        self._refresh_status()
+        self._refresh_eng_status()
 
     def _status(self) -> StatusBar:
         return self.query_one("#status", StatusBar)
 
-    def _log_line(self, line: str) -> None:
-        self.query_one("#lis-log", RichLog).write(line)
-
-    def _set_listener_status(self, text: str) -> None:
-        self.query_one("#lis-status", Static).update(text)
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-        if bid == "btn-listen-start":
-            self._start_listener()
-        elif bid == "btn-listen-stop":
-            self._stop_listener()
-
-    def action_toggle_listener(self) -> None:
-        if self.app.callback_server and self.app.callback_server.running:
-            self._stop_listener()
-        else:
-            self._start_listener()
-
-    def action_clear_log(self) -> None:
-        log = self.query_one("#lis-log", RichLog)
-        log.clear()
-
-    def _start_listener(self) -> None:
-        if self.app.callback_server and self.app.callback_server.running:
-            self._log_line("[yellow]already running.[/]")
-            return
-        try:
-            port = int(self.query_one("#inp-port", Input).value.strip() or "8080")
-        except ValueError:
-            self._log_line("[red]invalid port.[/]")
-            return
-
-        def on_hit(hit: Hit) -> None:
-            self.app.state.add_hit(hit.timestamp, hit.method,
-                                   hit.client_ip, hit.path)
-            self.app.call_from_thread(self._render_hit, hit)
-
-        try:
-            srv = CallbackServer(port=port, on_hit=on_hit)
-            srv.start()
-            self.app.callback_server = srv
-            self._set_listener_status(f"[green]listening on 0.0.0.0:{port}[/]")
-            self._log_line(f"[bold green]▸ listening[/] on 0.0.0.0:{port}")
-        except Exception as exc:  # noqa: BLE001
-            self._log_line(f"[bold red]bind failed:[/] {exc}")
-            self.app.callback_server = None
-
-    def _stop_listener(self) -> None:
-        if not self.app.callback_server or not self.app.callback_server.running:
-            self._log_line("[yellow]not running.[/]")
-            return
-        self.app.callback_server.stop()
-        self.app.callback_server = None
-        self._set_listener_status("[dim]idle[/]")
-        self._log_line("[yellow]■ listener stopped.[/]")
-
-    def _render_hit(self, hit: Hit) -> None:
-        self._log_line(
-            f"[magenta]{hit.timestamp}[/]  [cyan]{hit.method:<4}[/]  "
-            f"[b]{hit.client_ip:<15}[/]  {hit.path}  "
-            f"[dim]({hit.payload_id()})[/]"
-        )
+    def _refresh_status(self) -> None:
         s = self.app.state
         self._status().update_status(
             callback=s.callback, profile=s.profile,
             obfuscate=s.obfuscate, hits=len(s.hits),
             builds=len(s.recent_builds),
         )
+
+    def _refresh_eng_status(self) -> None:
+        sess = self.app.session
+        self.query_one("#lis-eng-status", Static).update(
+            f"[dim]engagement:[/] [b]{sess.name}[/]  "
+            f"[dim]callback:[/] [b]{sess.callback or '—'}[/]"
+        )
+
+    def _log_line(self, line: str) -> None:
+        self.query_one("#lis-log", RichLog).write(line)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "btn-http-start":
+            self._start_http()
+        elif bid == "btn-http-stop":
+            self._stop_http()
+        elif bid == "btn-dns-start":
+            self._start_dns()
+        elif bid == "btn-dns-stop":
+            self._stop_dns()
+        elif bid == "btn-export":
+            self.action_export()
+
+    def action_toggle_http(self) -> None:
+        if self.app.session.http and self.app.session.http.running:
+            self._stop_http()
+        else:
+            self._start_http()
+
+    def action_toggle_dns(self) -> None:
+        if self.app.session.dns and self.app.session.dns.running:
+            self._stop_dns()
+        else:
+            self._start_dns()
+
+    def action_clear_log(self) -> None:
+        self.query_one("#lis-log", RichLog).clear()
+
+    def action_export(self) -> None:
+        from nonpdf.net.store import export_engagement
+        out = Path(self.app.state.output_dir) / "bundle" / f"{self.app.session.name}.json"
+        try:
+            export_engagement(self.app.session.store, out)
+            self._log_line(f"[bold green]▸ exported[/] {out}")
+        except Exception as exc:  # noqa: BLE001
+            self._log_line(f"[red]export failed:[/] {exc}")
+
+    def _start_http(self) -> None:
+        try:
+            port = int(self.query_one("#inp-http-port", Input).value.strip() or "8080")
+        except ValueError:
+            self._log_line("[red]invalid HTTP port.[/]")
+            return
+        try:
+            used = self.app.session.start_http(port=port)
+            self.query_one("#lis-http-status", Static).update(
+                f"[green]HTTP listening on 0.0.0.0:{used}[/]"
+            )
+            self._log_line(f"[bold green]▸ HTTP[/] 0.0.0.0:{used}")
+        except Exception as exc:  # noqa: BLE001
+            self._log_line(f"[bold red]HTTP bind failed:[/] {exc}")
+
+    def _stop_http(self) -> None:
+        if self.app.session.http and self.app.session.http.running:
+            self.app.session.stop_http()
+            self.query_one("#lis-http-status", Static).update("[dim]HTTP idle[/]")
+            self._log_line("[yellow]■ HTTP stopped.[/]")
+        else:
+            self._log_line("[yellow]HTTP not running.[/]")
+
+    def _start_dns(self) -> None:
+        try:
+            port = int(self.query_one("#inp-dns-port", Input).value.strip() or "53")
+        except ValueError:
+            self._log_line("[red]invalid DNS port.[/]")
+            return
+        answer_ip = self.query_one("#inp-dns-answer", Input).value.strip() or "127.0.0.1"
+        try:
+            used = self.app.session.start_dns(port=port, answer_ip=answer_ip)
+            self.query_one("#lis-dns-status", Static).update(
+                f"[green]DNS listening on 0.0.0.0:{used} → {answer_ip}[/]"
+            )
+            self._log_line(
+                f"[bold green]▸ DNS[/] 0.0.0.0:{used}  (answer A → {answer_ip})"
+            )
+            self._log_line(
+                "[dim]note: port 53 usually requires root. use a higher port + "
+                "iptables redirect, or run with sudo.[/]"
+            )
+        except PermissionError:
+            self._log_line(
+                "[bold red]DNS bind failed:[/] permission denied on port 53. "
+                "try sudo, or use a high port with a redirect."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_line(f"[bold red]DNS bind failed:[/] {exc}")
+
+    def _stop_dns(self) -> None:
+        if self.app.session.dns and self.app.session.dns.running:
+            self.app.session.stop_dns()
+            self.query_one("#lis-dns-status", Static).update("[dim]DNS idle[/]")
+            self._log_line("[yellow]■ DNS stopped.[/]")
+        else:
+            self._log_line("[yellow]DNS not running.[/]")
+
+    # called from Session via app-level callback
+    def render_hit(self, hit: SessionHit) -> None:
+        tag = "[magenta]dns [/]" if hit.source == "dns" else "[cyan]http[/]"
+        corr_tag = (
+            f"  [b green]{hit.payload_id}[/]:[dim]{hit.payload_name}[/]"
+            if hit.payload_id else "  [dim](unmatched)[/]"
+        )
+        self._log_line(
+            f"{tag}  [b]{hit.ts}[/]  {hit.method:<4}  "
+            f"[b]{hit.client:<15}[/]  {hit.path}{corr_tag}"
+        )
+        self.query_one("#lis-hit-detail", Static).update(
+            f"[b cyan]{hit.source.upper()}[/]  {hit.method}  {hit.client}\n"
+            f"[dim]path:[/]  {hit.path}\n"
+            f"[dim]corr:[/]  {hit.corr_id or '—'}\n"
+            f"[dim]payload:[/]  [b]{hit.payload_id or '—'}[/] "
+            f"{hit.payload_name}\n"
+            f"[dim]desc:[/]  {hit.description or '—'}"
+        )
+        self._refresh_status()
 
     def action_goto(self, name: str) -> None:
         self.app.switch_screen(name)
@@ -536,6 +637,9 @@ class AboutScreen(Screen):
         lines = [f"[b cyan]registry[/]  {total} payloads total"]
         for k in sorted(by_plat):
             lines.append(f"  [dim]·[/] {k:<10} {by_plat[k]}")
+        lines.append("")
+        lines.append(f"[b cyan]engagement[/]  {self.app.session.name}")
+        lines.append(f"  [dim]·[/] callback  {self.app.session.callback or '—'}")
         self.query_one("#about-counts", Static).update("\n".join(lines))
         s = self.app.state
         self._status().update_status(
@@ -553,10 +657,10 @@ class AboutScreen(Screen):
             f"[b cyan]Creator:[/]  {__creator__}\n"
             f"[b cyan]Maintainer:[/]  Anonymous-beta\n\n"
             "NonPDF is a callback-driven PDF payload generation and "
-            "listening framework. Every artifact produced carries the "
-            "Anonymous-beta (chinedu) metadata signature: header comment, "
-            "/Info dictionary, and a visible footer credit.\n\n"
-            "[dim]Use only against systems you are authorized to test.[/]"
+            "listening framework. Each build mints a unique correlation "
+            "ID, so every HTTP or DNS callback maps back to the exact "
+            "payload that fired it.\n\n"
+            f"[dim]Engagements persist to ~/.nonpdf/engagements/[/]"
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
